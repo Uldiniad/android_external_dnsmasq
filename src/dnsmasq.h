@@ -387,6 +387,11 @@ struct frec {
     int fd, forwardall;
     unsigned int crc;
     time_t time;
+#ifdef __ANDROID__
+    int resolver_fd;      /* Android's resolver has the query and answers here, else -1 */
+    unsigned char* query; /* the query, for an answer of our own when the resolver has none */
+    size_t query_len;
+#endif
     struct frec* next;
 };
 
@@ -723,6 +728,10 @@ void reply_query(int fd, int family, time_t now);
 void receive_query(struct listener* listen, time_t now);
 unsigned char* tcp_request(int confd, time_t now, struct in_addr local_addr, struct in_addr netmask);
 void server_gone(struct server* server);
+#ifdef __ANDROID__
+void set_resolver_listeners(fd_set* set, int* maxfdp);
+void check_resolver_listeners(fd_set* set, time_t now);
+#endif
 struct frec* get_new_frec(time_t now, int* wait);
 
 /* network.c */

@@ -18,6 +18,10 @@
 
 #include <sys/stat.h>
 
+#ifdef __ANDROID__
+#include <private/android_filesystem_config.h>
+#endif
+
 #if defined(HAVE_BSD_NETWORK)
 #error Should not HAVE_BSD_NETWORK
 #endif
@@ -352,8 +356,14 @@ int main(int argc, char** argv) {
         int bad_capabilities = 0;
         gid_t unused;
 
+#ifdef __ANDROID__
+        /* keep only inet, the group Android's resolver takes queries from */
+        gid_t groups[] = {AID_INET};
+        if (gp && (setgroups(1, groups) == -1 || setgid(gp->gr_gid) == -1)) {
+#else
         /* remove all supplimentary groups */
         if (gp && (setgroups(0, &unused) == -1 || setgid(gp->gr_gid) == -1)) {
+#endif
             send_event(err_pipe[1], EVENT_GROUP_ERR, errno);
             _exit(0);
         }
@@ -858,6 +868,10 @@ static int set_dns_listeners(time_t now, fd_set* set, int* maxfdp) {
         bump_maxfd(serverfdp->fd, maxfdp);
     }
 
+#ifdef __ANDROID__
+    set_resolver_listeners(set, maxfdp);
+#endif
+
     if (daemon->port != 0 && !daemon->osport)
         for (i = 0; i < RANDOM_SOCKS; i++)
             if (daemon->randomsocks[i].refcount != 0) {
@@ -894,6 +908,10 @@ static void check_dns_listeners(fd_set* set, time_t now) {
     for (serverfdp = daemon->sfds; serverfdp; serverfdp = serverfdp->next)
         if (FD_ISSET(serverfdp->fd, set))
             reply_query(serverfdp->fd, serverfdp->source_addr.sa.sa_family, now);
+
+#ifdef __ANDROID__
+    check_resolver_listeners(set, now);
+#endif
 
     if (daemon->port != 0 && !daemon->osport)
         for (i = 0; i < RANDOM_SOCKS; i++)

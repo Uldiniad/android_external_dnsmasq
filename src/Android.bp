@@ -76,5 +76,6 @@ cc_binary {
     shared_libs: [
         "libcutils",
         "liblog",
+        "libnetd_client",
     ],
 }

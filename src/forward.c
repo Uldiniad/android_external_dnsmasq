@@ -16,6 +16,17 @@
 
 #include "dnsmasq.h"
 
+#ifdef __ANDROID__
+#include <NetdClient.h>
+#include <netdb.h>
+
+/* netd's fwmark keeps the network id in its low bits. */
+#define NET_ID_MASK 0xffff
+
+static int resolver_send(struct frec* forward, HEADER* header, size_t plen, struct server* server);
+static size_t resolver_answer(HEADER* header, size_t qlen, unsigned int net_id);
+#endif
+
 static struct frec* lookup_frec(unsigned short id, unsigned int crc);
 static struct frec* lookup_frec_by_sender(unsigned short id, union mysockaddr* addr,
                                           unsigned int crc);
@@ -246,6 +257,15 @@ static int forward_query(int udpfd, union mysockaddr* udpaddr, struct all_addr* 
        if we fail to send to all nameservers, send back an error
        packet straight away (helps modem users when offline)  */
 
+#ifdef __ANDROID__
+    /* Android's resolver answers on the servers' network, with its own servers, cache, Private
+       DNS and lookup policy, as for the phone's own apps. */
+    if (!flags && forward && start->mark) {
+        if (forward->resolver_fd != -1 || resolver_send(forward, header, plen, start)) return 1;
+        header->id = htons(forward->orig_id);
+        free_frec(forward); /* cancel */
+    } else
+#endif
     if (!flags && forward) {
         struct server* firstsentto = start;
         int forwarded = 0;
@@ -687,6 +707,11 @@ unsigned char* tcp_request(int confd, time_t now, struct in_addr local_addr,
             else
                 last_server = daemon->last_server;
 
+#ifdef __ANDROID__
+            if (!flags && last_server && last_server->mark)
+                m = resolver_answer(header, (size_t) size, last_server->mark & NET_ID_MASK);
+            else
+#endif
             if (!flags && last_server) {
                 struct server* firstsendto = NULL;
                 unsigned int crc = questions_crc(header, (unsigned int) size, daemon->namebuff);
@@ -786,6 +811,10 @@ static struct frec* allocate_frec(time_t now) {
 #ifdef HAVE_IPV6
         f->rfd6 = NULL;
 #endif
+#ifdef __ANDROID__
+        f->resolver_fd = -1;
+        f->query = NULL;
+#endif
         daemon->frec_list = f;
     }
 
@@ -832,6 +861,13 @@ static void free_frec(struct frec* f) {
     if (f->rfd6 && --(f->rfd6->refcount) == 0) close(f->rfd6->fd);
 
     f->rfd6 = NULL;
+#endif
+
+#ifdef __ANDROID__
+    if (f->resolver_fd != -1) close(f->resolver_fd);
+    f->resolver_fd = -1;
+    free(f->query);
+    f->query = NULL;
 #endif
 }
 
@@ -941,3 +977,107 @@ static unsigned short get_id(int force, unsigned short force_id, unsigned int cr
 
     return ret;
 }
+
+#ifdef __ANDROID__
+/* Gives the query to Android's resolver on the server's network. */
+static int resolver_send(struct frec* forward, HEADER* header, size_t plen, struct server* server) {
+    unsigned char* query = whine_malloc(plen);
+    int fd;
+
+    if (!query) return 0;
+    if ((fd = resNetworkSend(server->mark & NET_ID_MASK, (uint8_t*) header, plen, 0)) < 0) {
+        free(query);
+        return 0;
+    }
+    memcpy(query, header, plen);
+    forward->query = query;
+    forward->query_len = plen;
+    forward->resolver_fd = fd;
+    forward->sentto = server;
+    return 1;
+}
+
+/* The largest UDP answer the client takes: the size its EDNS gives, at least 512. */
+static size_t udp_limit(struct frec* forward) {
+    unsigned char* sizep;
+    unsigned short size = PACKETSZ;
+    int is_sign;
+
+    if (find_pseudoheader((HEADER*) forward->query, forward->query_len, NULL, &sizep, &is_sign)) {
+        GETSHORT(size, sizep);
+        if (size < PACKETSZ) size = PACKETSZ;
+    }
+    return size;
+}
+
+/* Answers the client with the resolver's answer, or with an answer of our own when there is none
+   for it: no such name when the phone's policy refused the name, and an empty truncated one when
+   the answer is too big for UDP, so that the client asks again over TCP. */
+static void resolver_reply(struct frec* forward, time_t now) {
+    HEADER* header = (HEADER*) daemon->packet;
+    int rcode = 0;
+    int n = resNetworkResult(forward->resolver_fd, &rcode, (uint8_t*) daemon->packet,
+                             daemon->packet_buff_sz);
+    size_t limit = udp_limit(forward);
+    size_t len = 0;
+
+    forward->resolver_fd = -1; /* resNetworkResult closed it */
+    daemon->srv_save = NULL;   /* packet buffer overwritten */
+    if (n >= (int) sizeof(HEADER) && (size_t) n <= limit)
+        len = n;
+    else if (forward->query_len <= (size_t) daemon->packet_buff_sz) {
+        int too_big = n > 0 || n == -EMSGSIZE;
+        memcpy(daemon->packet, forward->query, forward->query_len);
+        len = setup_reply(header, forward->query_len, NULL,
+                          too_big ? F_NOERR : n == -EAI_SYSTEM ? F_NXDOMAIN : F_NEG, 0);
+        header->tc = too_big;
+    }
+    if (len) {
+        header->id = htons(forward->orig_id);
+        header->ra = 1;
+        send_from(forward->fd, daemon->options & OPT_NOWILD, daemon->packet, len,
+                  &forward->source, &forward->dest, forward->iface);
+    }
+    free_frec(forward);
+}
+
+void set_resolver_listeners(fd_set* set, int* maxfdp) {
+    struct frec* f;
+
+    for (f = daemon->frec_list; f; f = f->next)
+        if (f->sentto && f->resolver_fd != -1) {
+            FD_SET(f->resolver_fd, set);
+            bump_maxfd(f->resolver_fd, maxfdp);
+        }
+}
+
+void check_resolver_listeners(fd_set* set, time_t now) {
+    struct frec* f;
+
+    for (f = daemon->frec_list; f; f = f->next)
+        if (f->sentto && f->resolver_fd != -1 && FD_ISSET(f->resolver_fd, set))
+            resolver_reply(f, now);
+}
+
+/* Asks Android's resolver and waits for its answer, for a query over TCP. The answer takes the
+   query's place in the packet, which has room for 65536 bytes. */
+static size_t resolver_answer(HEADER* header, size_t qlen, unsigned int net_id) {
+    unsigned char* query = whine_malloc(qlen);
+    int rcode = 0, n = -EIO, fd;
+    size_t m;
+
+    if (!query) return 0;
+    memcpy(query, header, qlen);
+    if ((fd = resNetworkSend(net_id, query, qlen, 0)) >= 0)
+        n = resNetworkResult(fd, &rcode, (uint8_t*) header, 65536);
+    if (n >= (int) sizeof(HEADER))
+        m = n;
+    else {
+        memcpy(header, query, qlen);
+        m = setup_reply(header, qlen, NULL, n == -EAI_SYSTEM ? F_NXDOMAIN : F_NEG, 0);
+        header->ra = 1;
+    }
+    free(query);
+    return m;
+}
+#endif
