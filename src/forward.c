@@ -24,7 +24,7 @@
 #define NET_ID_MASK 0xffff
 
 static int resolver_send(struct frec* forward, HEADER* header, size_t plen, struct server* server);
-static size_t resolver_answer(HEADER* header, size_t qlen, unsigned int net_id);
+static size_t resolver_answer(HEADER* header, size_t qlen, unsigned int net_id, int confd);
 #endif
 
 static struct frec* lookup_frec(unsigned short id, unsigned int crc);
@@ -709,7 +709,8 @@ unsigned char* tcp_request(int confd, time_t now, struct in_addr local_addr,
 
 #ifdef __ANDROID__
             if (!flags && last_server && last_server->mark)
-                m = resolver_answer(header, (size_t) size, last_server->mark & NET_ID_MASK);
+                m = resolver_answer(header, (size_t) size, last_server->mark & NET_ID_MASK,
+                                    confd);
             else
 #endif
             if (!flags && last_server) {
@@ -979,13 +980,17 @@ static unsigned short get_id(int force, unsigned short force_id, unsigned int cr
 }
 
 #ifdef __ANDROID__
-/* Gives the query to Android's resolver on the server's network. */
+/* Gives the query to Android's resolver on the server's network, saying which client it's for,
+   whose lookups the phone's policy may treat as that device's. */
 static int resolver_send(struct frec* forward, HEADER* header, size_t plen, struct server* server) {
     unsigned char* query = whine_malloc(plen);
     int fd;
 
     if (!query) return 0;
-    if ((fd = resNetworkSend(server->mark & NET_ID_MASK, (uint8_t*) header, plen, 0)) < 0) {
+    setThreadDnsClient(&forward->source.sa);
+    fd = resNetworkSend(server->mark & NET_ID_MASK, (uint8_t*) header, plen, 0);
+    setThreadDnsClient(NULL);
+    if (fd < 0) {
         free(query);
         return 0;
     }
@@ -1059,17 +1064,22 @@ void check_resolver_listeners(fd_set* set, time_t now) {
             resolver_reply(f, now);
 }
 
-/* Asks Android's resolver and waits for its answer, for a query over TCP. The answer takes the
-   query's place in the packet, which has room for 65536 bytes. */
-static size_t resolver_answer(HEADER* header, size_t qlen, unsigned int net_id) {
+/* Asks Android's resolver and waits for its answer, for a query over TCP from the client at the
+   connection's other end. The answer takes the query's place in the packet, which has room for
+   65536 bytes. */
+static size_t resolver_answer(HEADER* header, size_t qlen, unsigned int net_id, int confd) {
     unsigned char* query = whine_malloc(qlen);
+    union mysockaddr client;
+    socklen_t client_len = sizeof(client);
     int rcode = 0, n = -EIO, fd;
     size_t m;
 
     if (!query) return 0;
     memcpy(query, header, qlen);
-    if ((fd = resNetworkSend(net_id, query, qlen, 0)) >= 0)
-        n = resNetworkResult(fd, &rcode, (uint8_t*) header, 65536);
+    if (getpeername(confd, &client.sa, &client_len) == 0) setThreadDnsClient(&client.sa);
+    fd = resNetworkSend(net_id, query, qlen, 0);
+    setThreadDnsClient(NULL);
+    if (fd >= 0) n = resNetworkResult(fd, &rcode, (uint8_t*) header, 65536);
     if (n >= (int) sizeof(HEADER))
         m = n;
     else {
